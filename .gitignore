@@ -1,0 +1,54 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+*.egg
+
+# Virtual environment
+venv/
+.venv/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Outputs
+outputs/
+logs/
+wandb/
+
+# Data (keep sample files only)
+data/raw/*.zip
+data/raw/medqa_extracted/
+data/raw/medmcqa_extracted/
+data/raw/medqa_us_*.jsonl
+data/raw/medmcqa_*.jsonl
+data/raw/*.txt
+data/raw/stopwords_zh.json
+data/processed/
+data/eval/
+data/*.zip
+*.bin
+*.safetensors
+*.pt
+*.pth
+
+# External cloned repos
+MedQA/
+
+# Claude local settings
+.claude/
+
+# Environment
+.env
+.env.local
+
+# macOS
+.DS_Store
+
+# Jupyter
+.ipynb_checkpoints/

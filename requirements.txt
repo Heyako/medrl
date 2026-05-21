@@ -1,0 +1,35 @@
+# Core ML
+torch>=2.1.0
+transformers>=4.36.0
+accelerate>=0.25.0
+datasets>=2.15.0
+tokenizers>=0.15.0
+
+# RL & Training
+trl>=0.7.0
+deepspeed>=0.12.0
+
+# Attention optimization
+flash-attn>=2.3.0
+
+# Data processing
+pandas>=2.0.0
+numpy>=1.24.0
+scipy>=1.10.0
+
+# API clients (LLM Judge / CoT splitter)
+openai>=1.6.0
+anthropic>=0.18.0
+
+# Visualization
+matplotlib>=3.7.0
+seaborn>=0.12.0
+
+# Configuration
+pyyaml>=6.0
+omegaconf>=2.3.0
+
+# Utilities
+tqdm>=4.65.0
+wandb>=0.15.0
+rich>=13.0.0

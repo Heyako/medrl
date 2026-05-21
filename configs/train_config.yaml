@@ -1,0 +1,47 @@
+# MedRL Training Configuration
+# GRPO training for Qwen2.5-7B-Instruct medical reasoning alignment
+
+model:
+  name_or_path: "Qwen/Qwen2.5-7B-Instruct"
+  torch_dtype: "float16"
+  attn_implementation: "flash_attention_2"  # FlashAttention-2 for efficiency
+  use_cache: false  # Disable KV cache during training
+
+grpo:
+  group_size: 8          # G: responses per prompt
+  batch_size: 4          # B: prompts per step
+  clip_epsilon: 0.2      # PPO clipping parameter
+  ppo_epochs: 1          # PPO updates per batch
+  kl_beta: 0.01          # Initial KL penalty coefficient
+  target_kl: 0.02        # Target KL divergence
+  temperature: 0.8       # Sampling temperature
+  top_p: 0.9             # Nucleus sampling
+  max_new_tokens: 1024   # Max response length
+
+reward:
+  w_format: 0.15         # Format compliance weight
+  w_judge: 0.70          # LLM judge score weight
+  w_diversity: 0.15      # Diversity bonus weight
+  judge_model: "gpt-4"   # API model for LLM judge
+
+optimizer:
+  learning_rate: 1.0e-6
+  weight_decay: 0.01
+  max_grad_norm: 1.0
+  lr_scheduler: "cosine"
+  warmup_steps: 100
+
+training:
+  max_steps: 5000
+  save_interval: 500
+  eval_interval: 500
+  log_interval: 10
+  output_dir: "./outputs"
+
+deepseek:
+  config: "configs/deepspeed_zero2.json"  # or deepspeed_zero3.json for CPU offload
+
+data:
+  train_path: "data/processed/train.jsonl"
+  eval_path: "data/processed/eval.jsonl"
+  max_seq_len: 4096
