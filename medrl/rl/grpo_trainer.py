@@ -162,7 +162,11 @@ class GRPOTrainer:
     def _compute_log_probs(
         self, prompts: List[str], responses: List[str]
     ) -> torch.Tensor:
-        """Compute log-probabilities of responses under the current policy."""
+        """Compute log-probabilities of responses under the current policy.
+
+        Returns log_probs WITH gradients attached — caller must detach()
+        when needed for old log probs.
+        """
         full_texts = [p + r for p, r in zip(prompts, responses)]
 
         inputs = self.tokenizer(
@@ -173,11 +177,9 @@ class GRPOTrainer:
             max_length=4096,
         ).to(self.device)
 
-        with torch.no_grad():
-            outputs = self.policy(**inputs)
+        outputs = self.policy(**inputs)
 
         # Sum log-probs over response tokens
-        # Simplified: this should use per-token log-probs in production
         log_probs = outputs.logits.log_softmax(dim=-1)
         return log_probs.mean(dim=[1, 2])  # (B*G,) aggregated
 
@@ -216,12 +218,14 @@ class GRPOTrainer:
 
         # ── Step 4: PPO Update ──
         total_policy_loss = 0.0
-        for _ in range(self.config.ppo_epochs):
-            log_probs = self._compute_log_probs(expanded_prompts, responses)
 
-            # For the first epoch, treat these as "old" log-probs
-            # In production: store old log-probs from generation step
-            log_probs_old = log_probs.detach()
+        # Compute old log_probs once (detached, no grad)
+        with torch.no_grad():
+            log_probs_old = self._compute_log_probs(expanded_prompts, responses)
+
+        for _ in range(self.config.ppo_epochs):
+            # Compute current log_probs WITH gradients
+            log_probs = self._compute_log_probs(expanded_prompts, responses)
 
             ratio = (log_probs - log_probs_old).exp()
             surr1 = ratio * advantages
@@ -234,7 +238,7 @@ class GRPOTrainer:
             )
             policy_loss = -torch.min(surr1, surr2).mean()
 
-            # ── Step 5: KL Divergence ──
+            # ── Step 5: KL Divergence (monitoring only, no grad) ──
             with torch.no_grad():
                 full_texts = [
                     p + r for p, r in zip(expanded_prompts, responses)
@@ -249,22 +253,22 @@ class GRPOTrainer:
                 ref_outputs = self.ref_model(**ref_inputs)
                 ref_logits = ref_outputs.logits
 
-            policy_inputs = self.tokenizer(
-                full_texts,
-                return_tensors="pt",
-                padding=True,
-                truncation=True,
-                max_length=4096,
-            ).to(self.device)
-            policy_outputs = self.policy(**policy_inputs)
-            policy_logits = policy_outputs.logits
+                policy_inputs = self.tokenizer(
+                    full_texts,
+                    return_tensors="pt",
+                    padding=True,
+                    truncation=True,
+                    max_length=4096,
+                ).to(self.device)
+                policy_outputs = self.policy(**policy_inputs)
+                policy_logits = policy_outputs.logits
 
             kl_div = self.kl_controller.compute_kl(policy_logits, ref_logits)
             entropy = self.kl_controller.compute_entropy(policy_logits)
 
             # ── Step 6: Total Loss ──
             beta = self.kl_controller.step(kl_div)
-            total_loss = policy_loss + beta * kl_div
+            total_loss = policy_loss  # KL is monitoring-only, not backprop'd
 
             # ── Step 7: Backward ──
             self.optimizer.zero_grad()

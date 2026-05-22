@@ -184,6 +184,57 @@ Output ONLY a JSON object:
         else:
             return diversity
 
+    # ── Component 4: Heuristic quality score (no-LLM-judge fallback) ──
+
+    # Medical reasoning structure indicators
+    REASONING_MARKERS = [
+        r"Step\s*\d+",
+        r"(?i)(therefore|thus|hence|consequently|as a result)",
+        r"(?i)(diagnosis|diagnose|diagnosed)",
+        r"(?i)(indicated|contraindicated|recommended)",
+        r"(?i)(eliminate|rule out|exclude|differential)",
+        r"(?i)(guideline|ACC|AHA|GOLD|KDIGO)",
+    ]
+
+    def _heuristic_score(self, response: str) -> float:
+        """
+        Score response quality using cheap heuristics.
+        Used when LLM judge is unavailable (Phase 1).
+
+        Returns a score in [0, 1] that varies meaningfully across responses.
+        """
+        score = 0.0
+
+        # 1. Step structure: 3-8 steps is ideal
+        step_count = len(re.findall(r"Step\s*\d+", response, re.IGNORECASE))
+        if step_count >= 5:
+            score += 0.3
+        elif step_count >= 3:
+            score += 0.2
+        elif step_count >= 1:
+            score += 0.1
+
+        # 2. Reasoning depth: check for diverse reasoning markers
+        marker_hits = sum(
+            1 for pattern in self.REASONING_MARKERS
+            if re.search(pattern, response)
+        )
+        score += min(0.3, marker_hits * 0.06)
+
+        # 3. Length quality: penalize too short (<200 chars) or excessive (>3000)
+        length = len(response)
+        if 500 <= length <= 2500:
+            score += 0.2
+        elif 200 <= length <= 500:
+            score += 0.1
+
+        # 4. Option elimination quality: check for option letters mentioned
+        option_hits = len(re.findall(r"\bOption\s*[A-E]\b", response, re.IGNORECASE))
+        option_hits += len(re.findall(r"\b[A-E][\.\)]\s", response))
+        score += min(0.2, option_hits * 0.05)
+
+        return max(0.0, min(1.0, score))
+
     # ── Composite ──
 
     def __call__(
@@ -214,8 +265,11 @@ Output ONLY a JSON object:
             # Only call judge if format is compliant (save API cost)
             if r_format > 0 and self.use_judge:
                 r_judge = self.judge_reward(question, response)
+            elif r_format < 0:
+                r_judge = 0.0
             else:
-                r_judge = 0.0 if r_format < 0 else 0.5
+                # Heuristic fallback — varies per response, not flat 0.5
+                r_judge = self._heuristic_score(response)
 
             # Weighted combination
             total = (
