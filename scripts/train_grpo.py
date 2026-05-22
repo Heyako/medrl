@@ -68,13 +68,22 @@ def main():
     device = "cuda" if torch.cuda.is_available() else "cpu"
     logger.info(f"Using device: {device}")
 
+    # Detect best attention implementation
+    try:
+        import flash_attn
+        attn_impl = "flash_attention_2"
+        logger.info("Using FlashAttention-2")
+    except ImportError:
+        attn_impl = "sdpa"
+        logger.info("FlashAttention not found, using SDPA (PyTorch built-in)")
+
     # Load model
     logger.info(f"Loading model: {args.model_name_or_path}")
     model = AutoModelForCausalLM.from_pretrained(
         args.model_name_or_path,
-        torch_dtype=torch.float16 if device == "cuda" else torch.float32,
+        dtype=torch.float16 if device == "cuda" else torch.float32,
         device_map="auto" if device == "cuda" else None,
-        attn_implementation="flash_attention_2",
+        attn_implementation=attn_impl,
         trust_remote_code=True,
     )
     tokenizer = AutoTokenizer.from_pretrained(
@@ -87,8 +96,9 @@ def main():
     logger.info("Loading reference model...")
     ref_model = AutoModelForCausalLM.from_pretrained(
         args.model_name_or_path,
-        torch_dtype=torch.float16 if device == "cuda" else torch.float32,
+        dtype=torch.float16 if device == "cuda" else torch.float32,
         device_map="auto" if device == "cuda" else None,
+        attn_implementation=attn_impl,
         trust_remote_code=True,
     )
 

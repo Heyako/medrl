@@ -298,7 +298,7 @@ class CoTSplitter:
 
         model_kwargs = {
             "trust_remote_code": True,
-            "torch_dtype": torch.float16 if self.device == "cuda" else torch.float32,
+            "dtype": torch.float16 if self.device == "cuda" else torch.float32,
         }
         if load_in_4bit:
             model_kwargs.update({
