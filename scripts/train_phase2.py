@@ -138,7 +138,7 @@ def parse_args():
     p.add_argument("--batch_size", type=int, default=2)
     p.add_argument("--max_steps", type=int, default=2000)
     p.add_argument("--max_new_tokens", type=int, default=1024)
-    p.add_argument("--temperature", type=float, default=0.8)
+    p.add_argument("--temperature", type=float, default=1.0)
     p.add_argument("--learning_rate", type=float, default=5e-7)
     p.add_argument("--kl_beta", type=float, default=0.01)
     p.add_argument("--target_kl", type=float, default=0.02)
@@ -159,7 +159,9 @@ def main():
 
     if device == "cuda":
         props = torch.cuda.get_device_properties(0)
-        logger.info(f"GPU: {props.name} ({props.total_mem / 1e9:.1f} GB)")
+    traceback (most recent call last):
+  File "/root/medrl/scripts/train_phase2.py", line 162, in main
+    logger.info(f"GPU: {props.name} ({props.total_mem / 1e9:.1f} GB)")
 
     # ── Load models ──
     model, tokenizer = load_model_with_lora(args.model, device, args)

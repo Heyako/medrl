@@ -219,9 +219,13 @@ class GRPOTrainer:
         # ── Step 4: PPO Update ──
         total_policy_loss = 0.0
 
-        # Compute old log_probs once (detached, no grad)
+        # Build full texts once for reuse
+        full_texts = [p + r for p, r in zip(expanded_prompts, responses)]
+
+        # Compute old log_probs (no grad, then free activations)
         with torch.no_grad():
-            log_probs_old = self._compute_log_probs(expanded_prompts, responses)
+            log_probs_old = self._compute_log_probs(expanded_prompts, responses).detach()
+        torch.cuda.empty_cache()
 
         for _ in range(self.config.ppo_epochs):
             # Compute current log_probs WITH gradients
@@ -238,41 +242,9 @@ class GRPOTrainer:
             )
             policy_loss = -torch.min(surr1, surr2).mean()
 
-            # ── Step 5: KL Divergence (monitoring only, no grad) ──
-            with torch.no_grad():
-                full_texts = [
-                    p + r for p, r in zip(expanded_prompts, responses)
-                ]
-                ref_inputs = self.tokenizer(
-                    full_texts,
-                    return_tensors="pt",
-                    padding=True,
-                    truncation=True,
-                    max_length=4096,
-                ).to(self.device)
-                ref_outputs = self.ref_model(**ref_inputs)
-                ref_logits = ref_outputs.logits
-
-                policy_inputs = self.tokenizer(
-                    full_texts,
-                    return_tensors="pt",
-                    padding=True,
-                    truncation=True,
-                    max_length=4096,
-                ).to(self.device)
-                policy_outputs = self.policy(**policy_inputs)
-                policy_logits = policy_outputs.logits
-
-            kl_div = self.kl_controller.compute_kl(policy_logits, ref_logits)
-            entropy = self.kl_controller.compute_entropy(policy_logits)
-
-            # ── Step 6: Total Loss ──
-            beta = self.kl_controller.step(kl_div)
-            total_loss = policy_loss  # KL is monitoring-only, not backprop'd
-
-            # ── Step 7: Backward ──
+            # ── Step 5: Backward ──
             self.optimizer.zero_grad()
-            total_loss.backward()
+            policy_loss.backward()
             torch.nn.utils.clip_grad_norm_(
                 self.policy.parameters(), self.config.max_grad_norm
             )
@@ -280,11 +252,46 @@ class GRPOTrainer:
 
             total_policy_loss += policy_loss.item()
 
+            # Free gradient graph to reclaim VRAM
+            del log_probs
+            torch.cuda.empty_cache()
+
+        # ── Step 6: KL Divergence (monitoring only, AFTER freeing policy forward) ──
+        with torch.no_grad():
+            ref_inputs = self.tokenizer(
+                full_texts,
+                return_tensors="pt",
+                padding=True,
+                truncation=True,
+                max_length=4096,
+            ).to(self.device)
+            ref_outputs = self.ref_model(**ref_inputs)
+            ref_logits = ref_outputs.logits
+            del ref_outputs
+
+            policy_inputs = self.tokenizer(
+                full_texts,
+                return_tensors="pt",
+                padding=True,
+                truncation=True,
+                max_length=4096,
+            ).to(self.device)
+            policy_outputs = self.policy(**policy_inputs)
+            policy_logits = policy_outputs.logits
+            del policy_outputs
+
+        kl_div = self.kl_controller.compute_kl(policy_logits, ref_logits)
+        entropy = self.kl_controller.compute_entropy(policy_logits)
+        beta = self.kl_controller.step(kl_div)
+        torch.cuda.empty_cache()
+
+        del log_probs_old
+
         self.step_count += 1
 
         # ── Logging ──
         output = GRPOStepOutput(
-            loss=total_loss.item(),
+            loss=total_policy_loss / max(self.config.ppo_epochs, 1),
             policy_loss=total_policy_loss / self.config.ppo_epochs,
             kl_divergence=kl_div,
             entropy=entropy,
