@@ -274,14 +274,16 @@ class CoTSplitter:
         model_name: str = "Qwen/Qwen2.5-1.5B-Instruct",
         device: str = "cuda",
         load_in_4bit: bool = False,
-        # API settings (Phase 2+)
+        # API settings (Phase 2+, supports DeepSeek/OpenAI/etc.)
         api_key: Optional[str] = None,
-        api_model: str = "gpt-4",
+        api_model: str = "deepseek-chat",
+        api_base_url: str = "https://api.deepseek.com/v1",
     ):
         self.model_name = model_name
         self.device = device if torch.cuda.is_available() else "cpu"
         self.api_key = api_key
         self.api_model = api_model
+        self.api_base_url = api_base_url
 
         self.model = None
         self.tokenizer = None
@@ -362,10 +364,13 @@ class CoTSplitter:
         return self.tokenizer.decode(generated_ids, skip_special_tokens=True)
 
     def generate_with_api(self, question: str, answer: str) -> str:
-        """Generate CoT using API (Phase 2+)."""
+        """Generate CoT using API (Phase 2+, provider-agnostic)."""
         import openai
 
-        client = openai.OpenAI(api_key=self.api_key)
+        client = openai.OpenAI(
+            api_key=self.api_key,
+            base_url=self.api_base_url,
+        )
         prompt = build_few_shot_prompt(question, answer)
 
         response = client.chat.completions.create(
@@ -417,10 +422,13 @@ class CoTSplitter:
     def generate_mc_with_api(
         self, question: str, options_block: str, answer: str
     ) -> str:
-        """Generate CoT for MC question using API (Phase 2+)."""
+        """Generate CoT for MC question using API (Phase 2+, provider-agnostic)."""
         import openai
 
-        client = openai.OpenAI(api_key=self.api_key)
+        client = openai.OpenAI(
+            api_key=self.api_key,
+            base_url=self.api_base_url,
+        )
         prompt = build_few_shot_prompt_mc(question, options_block, answer)
 
         response = client.chat.completions.create(

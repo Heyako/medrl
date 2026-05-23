@@ -102,11 +102,15 @@ def main():
         trust_remote_code=True,
     )
 
-    # Composite reward function
+    # Composite reward function — supports DeepSeek (default), OpenAI, etc.
+    judge_api_key = os.environ.get("JUDGE_API_KEY") or os.environ.get("OPENAI_API_KEY")
+    judge_base_url = os.environ.get("JUDGE_BASE_URL", "https://api.deepseek.com/v1")
+    judge_model = os.environ.get("JUDGE_MODEL", "deepseek-chat")
     reward_func = CompositeReward(
-        api_key=os.environ.get("OPENAI_API_KEY"),
-        judge_model="gpt-4",
-        use_judge=bool(os.environ.get("OPENAI_API_KEY")),
+        api_key=judge_api_key,
+        judge_model=judge_model,
+        judge_base_url=judge_base_url,
+        use_judge=bool(judge_api_key),
     )
 
     # GRPO config

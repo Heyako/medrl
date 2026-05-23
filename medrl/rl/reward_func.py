@@ -65,7 +65,8 @@ class CompositeReward:
         w_judge: float = 0.70,
         w_diversity: float = 0.15,
         api_key: Optional[str] = None,
-        judge_model: str = "gpt-4",
+        judge_model: str = "deepseek-chat",
+        judge_base_url: str = "https://api.deepseek.com/v1",
         use_judge: bool = True,
     ):
         self.w_format = w_format
@@ -73,6 +74,7 @@ class CompositeReward:
         self.w_diversity = w_diversity
         self.api_key = api_key
         self.judge_model = judge_model
+        self.judge_base_url = judge_base_url
         self.use_judge = use_judge
 
     # ── Component 1: Format Reward (hard constraint) ──
@@ -120,19 +122,26 @@ Output ONLY a JSON object:
 
     def judge_reward(self, question: str, response: str) -> float:
         """
-        Use LLM to score the response continuously on 0-1 scale.
+        Use LLM (DeepSeek/OpenAI/any OpenAI-compatible) to score the
+        response continuously on 0-1 scale.
+
+        Supports any provider that exposes an OpenAI-compatible chat
+        completions endpoint (DeepSeek, Qwen-Max, GLM-4, Kimi, etc.).
 
         Returns the overall score as a single float.
         """
         if not self.use_judge or not self.api_key:
-            return 0.5  # neutral default when judge is unavailable
+            return self._heuristic_score(response)
 
         import openai
 
-        client = openai.OpenAI(api_key=self.api_key)
+        client = openai.OpenAI(
+            api_key=self.api_key,
+            base_url=self.judge_base_url,
+        )
         prompt = self.JUDGE_PROMPT.format(
             question=question, response=response[:3000]
-        )  # truncate for API
+        )  # truncate for API cost control
 
         try:
             resp = client.chat.completions.create(
@@ -147,7 +156,7 @@ Output ONLY a JSON object:
             return max(0.0, min(1.0, score))
         except Exception as e:
             logger.error(f"Judge evaluation failed: {e}")
-            return 0.5
+            return self._heuristic_score(response)
 
     # ── Component 3: Diversity Bonus ──
 

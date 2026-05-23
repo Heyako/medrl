@@ -1,0 +1,71 @@
+# MedRL Phase 2: Medium-scale GRPO on Qwen2.5-7B
+# Target: RTX A6000 48GB, single GPU
+
+model:
+  name_or_path: "Qwen/Qwen2.5-7B-Instruct"
+  dtype: "float16"
+  attn_implementation: "sdpa"  # flash_attention_2 if available
+  use_cache: false
+
+lora:
+  enabled: true
+  r: 16            # LoRA rank
+  alpha: 32         # LoRA scaling
+  target_modules:    # Qwen2.5 attention projections
+    - "q_proj"
+    - "k_proj"
+    - "v_proj"
+    - "o_proj"
+    - "gate_proj"
+    - "up_proj"
+    - "down_proj"
+  dropout: 0.05
+  bias: "none"
+
+grpo:
+  group_size: 4          # Conservative: 4 responses per prompt (48GB limit)
+  batch_size: 2          # 2 prompts per step
+  clip_epsilon: 0.2
+  ppo_epochs: 1
+  kl_beta: 0.01
+  target_kl: 0.02
+  temperature: 0.8
+  top_p: 0.9
+  max_new_tokens: 1024   # Full reasoning chain
+
+reward:
+  w_format: 0.15
+  w_judge: 0.70
+  w_diversity: 0.15
+  judge_model: "deepseek-chat"
+  judge_base_url: "https://api.deepseek.com/v1"
+
+optimizer:
+  learning_rate: 5.0e-7  # Lower LR for 7B
+  weight_decay: 0.01
+  max_grad_norm: 1.0
+  lr_scheduler: "cosine"
+  warmup_steps: 50
+
+training:
+  max_steps: 2000
+  save_interval: 200
+  eval_interval: 200
+  log_interval: 5
+  gradient_checkpointing: true
+  output_dir: "./outputs/phase2"
+
+deepspeed:
+  config: "configs/deepspeed_zero3_7b.json"
+
+data:
+  train_path: "data/raw/medqa_us_train.jsonl"
+  medmcqa_path: "data/raw/medmcqa_train.jsonl"
+  max_seq_len: 2048
+
+judge:
+  api_key_env: "JUDGE_API_KEY"
+  base_url: "https://api.deepseek.com/v1"
+  model: "deepseek-chat"
+  max_concurrent: 5       # API rate limit control
+  batch_delay: 0.5        # Seconds between judge API calls

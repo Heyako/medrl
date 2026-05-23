@@ -1,0 +1,50 @@
+{
+  "train_batch_size": "auto",
+  "train_micro_batch_size_per_gpu": 1,
+  "gradient_accumulation_steps": 4,
+  "gradient_clipping": 1.0,
+  "zero_optimization": {
+    "stage": 3,
+    "offload_optimizer": {
+      "device": "cpu",
+      "pin_memory": true
+    },
+    "offload_param": {
+      "device": "cpu",
+      "pin_memory": true,
+      "buffer_count": 5,
+      "buffer_size": 1e8
+    },
+    "overlap_comm": true,
+    "contiguous_gradients": true,
+    "reduce_bucket_size": 5e7,
+    "stage3_prefetch_bucket_size": 5e7,
+    "stage3_param_persistence_threshold": 1e6,
+    "stage3_max_live_parameters": 1e9,
+    "stage3_max_reuse_distance": 1e9,
+    "stage3_gather_16bit_weights_on_model_save": true,
+    "sub_group_size": 1e9
+  },
+  "fp16": {
+    "enabled": true,
+    "auto_cast": true,
+    "loss_scale": 0,
+    "initial_scale_power": 16,
+    "loss_scale_window": 1000,
+    "hysteresis": 2,
+    "min_loss_scale": 1
+  },
+  "gradient_checkpointing": {
+    "use_reentrant": false
+  },
+  "activation_checkpointing": {
+    "partition_activations": true,
+    "cpu_checkpointing": true,
+    "number_checkpoints": 4,
+    "synchronize_checkpoint_boundary": false,
+    "profile": false
+  },
+  "communication_data_type": "fp16",
+  "wall_clock_breakdown": false,
+  "steps_per_print": 10
+}

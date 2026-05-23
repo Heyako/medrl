@@ -8,6 +8,7 @@ tokenizers>=0.15.0
 # RL & Training
 trl>=0.7.0
 deepspeed>=0.12.0
+peft>=0.10.0
 
 # Attention optimization
 flash-attn>=2.3.0
