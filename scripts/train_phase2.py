@@ -29,6 +29,7 @@ Usage:
 import argparse
 import json
 import os
+import random
 import sys
 from pathlib import Path
 from typing import List, Optional
@@ -150,6 +151,8 @@ def parse_args():
     # Data
     p.add_argument("--train_data", type=str, default="data/raw/medqa_us_train.jsonl")
     p.add_argument("--output_dir", type=str, default="outputs/phase2")
+    p.add_argument("--save_interval", type=int, default=200)
+    p.add_argument("--skip_smoke", action="store_true")
     return p.parse_args()
 
 
@@ -159,9 +162,7 @@ def main():
 
     if device == "cuda":
         props = torch.cuda.get_device_properties(0)
-    traceback (most recent call last):
-  File "/root/medrl/scripts/train_phase2.py", line 162, in main
-    logger.info(f"GPU: {props.name} ({props.total_mem / 1e9:.1f} GB)")
+        logger.info(f"GPU: {props.name} ({props.total_memory / 1e9:.1f} GB)")
 
     # ── Load models ──
     model, tokenizer = load_model_with_lora(args.model, device, args)
@@ -177,8 +178,8 @@ def main():
         judge_model=judge_model,
         judge_base_url=judge_base_url,
         use_judge=bool(judge_api_key),
-        w_format=0.15,
-        w_judge=0.70,
+        w_format=0.2,
+        w_judge=0.65,
         w_diversity=0.15,
     )
 
@@ -218,33 +219,70 @@ def main():
         device=device,
     )
 
-    # ── Smoke test ──
-    logger.info("Running smoke test (1 step)...")
-    test_prompts = [
-        "Question: A 55-year-old male presents with crushing chest pain, "
-        "ST elevation in II/III/aVF. What is the most likely diagnosis?\n\n"
-        "Options:\nA. Pericarditis\nB. Inferior STEMI\nC. Unstable angina\n"
-        "D. Aortic dissection\n\n"
-        "Please reason step by step in <thinking>...</thinking> tags, "
-        "then provide your final answer in <answer>...</answer> tags."
-    ] * args.batch_size
+    # ── Load training data ──
+    from medrl.data.dataset_loader import load_medqa, format_mc_question, format_mc_answer
+    from medrl.data.dataset_loader import load_medmcqa
 
+    logger.info(f"Loading training data: {args.train_data}")
     try:
-        out = trainer.step(test_prompts)
-        logger.info(
-            f"Smoke test: loss={out.loss:.4f}, KL={out.kl_divergence:.5f}, "
-            f"reward_mean={out.mean_reward:.3f}, reward_std={out.reward_std:.3f}, "
-            f"format_violation={out.format_violation_rate:.2%}"
-        )
-    except Exception as e:
-        logger.error(f"Smoke test failed: {e}")
-        raise
+        if 'medmcqa' in args.train_data:
+            train_samples = load_medmcqa(args.train_data)
+        else:
+            train_samples = load_medqa(args.train_data)
+    except Exception:
+        logger.warning("MedQA loader failed, trying MedMCQA...")
+        train_samples = load_medmcqa(args.train_data)
 
-    logger.info("Phase 2 pipeline functional. Ready for full training.")
-    logger.info(
-        f"To start: python scripts/train_phase2.py "
-        f"--max_steps {args.max_steps}"
-    )
+    logger.info(f"Loaded {len(train_samples)} training samples")
+
+    # Build prompts from dataset
+    def build_prompt(sample):
+        q = format_mc_question(sample)
+        a = format_mc_answer(sample)
+        return (
+            f"{q}\n\n"
+            f"Correct answer: {a}\n\n"
+            f"Explain step-by-step why this is the correct answer and why "
+            f"each alternative is wrong. Use <thinking>...</thinking> for "
+            f"reasoning and <answer>...</answer> for the final answer."
+        )
+
+    all_train_prompts = [build_prompt(s) for s in train_samples]
+    logger.info(f"Built {len(all_train_prompts)} training prompts")
+
+    # ── Training loop ──
+    import random
+    logger.info(f"Starting GRPO training: {args.max_steps} steps, "
+                f"batch_size={args.batch_size}, group_size={args.group_size}")
+
+    for step in range(args.max_steps):
+        # Sample batch of prompts WITH correct answers for reward correctness check
+        batch_indices = random.sample(range(len(all_train_prompts)), min(args.batch_size, len(all_train_prompts)))
+        batch = [all_train_prompts[i] for i in batch_indices]
+        batch_answers = [train_samples[i]['answer_text'] for i in batch_indices]
+        # Expand answers to match group_size
+        trainer._current_correct_answers = [a for a in batch_answers for _ in range(args.group_size)]
+
+        try:
+            out = trainer.step(batch)
+            logger.info(
+                f"Step {step+1}/{args.max_steps}: "
+                f"loss={out.loss:.4f}, reward_mean={out.mean_reward:.3f}, "
+                f"reward_std={out.reward_std:.3f}, "
+                f"format_ok={1-out.format_violation_rate:.0%}"
+            )
+        except Exception as e:
+            logger.error(f"Step {step+1} failed: {e}")
+            raise
+
+        # Checkpoint
+        if (step + 1) % args.save_interval == 0:
+            model.save_pretrained(f"{args.output_dir}/step_{step+1}")
+            logger.info(f"Checkpoint saved: step {step+1}")
+
+    # Final save
+    model.save_pretrained(f"{args.output_dir}/final")
+    logger.info(f"Training complete. Model saved to {args.output_dir}/final")
 
 
 if __name__ == "__main__":

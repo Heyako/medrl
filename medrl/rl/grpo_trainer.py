@@ -11,7 +11,6 @@ from typing import Optional, Dict, Any, List, Callable
 from dataclasses import dataclass, field
 
 import torch
-import torch.nn.functional as F
 from torch.utils.data import DataLoader
 
 from medrl.rl.reward_func import CompositeReward
@@ -126,10 +125,20 @@ class GRPOTrainer:
 
     def _generate_responses(self, prompts: List[str]) -> List[str]:
         """Generate G responses for each prompt (group sampling)."""
+        format_instruction = (
+            "You MUST respond in this exact format:\n"
+            "<thinking>\nStep 1: [your reasoning]\n"
+            "Step 2: [your reasoning]\n"
+            "...\n"
+            "</thinking>\n"
+            "<answer>\n[your final answer]\n"
+            "</answer>\n\n"
+        )
         all_prompts = []
         for p in prompts:
-            all_prompts.extend([p] * self.config.group_size)
+            all_prompts.extend([format_instruction + p] * self.config.group_size)
 
+        self.tokenizer.padding_side = "left"
         # Tokenize
         inputs = self.tokenizer(
             all_prompts,
@@ -160,15 +169,40 @@ class GRPOTrainer:
         return responses
 
     def _compute_log_probs(
-        self, prompts: List[str], responses: List[str]
+        self,
+        prompts: List[str],
+        responses: List[str],
+        model: Optional[torch.nn.Module] = None,
     ) -> torch.Tensor:
-        """Compute log-probabilities of responses under the current policy.
+        """Compute mean per-token log-probability of responses under a model.
 
-        Returns log_probs WITH gradients attached — caller must detach()
-        when needed for old log probs.
+        Correctly gathers log-probs at actual response token positions:
+          1. Tokenize prompt+response together
+          2. Tokenize prompts separately to locate response start boundary
+          3. Forward pass → logits → log_softmax
+          4. Gather log-prob of each actual response token
+          5. Mean over response tokens → scalar per sample
+
+        Uses mean (not sum) for numerical stability — keeps values in [-10, 0]
+        range regardless of response length, so PPO ratio = exp(mean_new - mean_old)
+        stays well-behaved.
+
+        Args:
+            prompts:   list of prompt strings
+            responses: list of response strings (same length)
+            model:     model to evaluate under (defaults to self.policy)
+
+        Returns:
+            log_probs: (batch,) tensor of mean per-token log-probabilities
+                       WITH gradients attached when model=self.policy.
         """
+        if model is None:
+            model = self.policy
+
+        batch_size = len(prompts)
         full_texts = [p + r for p, r in zip(prompts, responses)]
 
+        # Tokenize full concatenated texts
         inputs = self.tokenizer(
             full_texts,
             return_tensors="pt",
@@ -176,16 +210,64 @@ class GRPOTrainer:
             truncation=True,
             max_length=4096,
         ).to(self.device)
+        input_ids = inputs["input_ids"]          # (batch, max_seq_len)
+        attention_mask = inputs["attention_mask"]  # (batch, max_seq_len)
 
-        outputs = self.policy(**inputs)
+        # Tokenize prompts alone to get per-sample prompt lengths
+        prompt_enc = self.tokenizer(
+            prompts,
+            return_tensors="pt",
+            padding=True,
+            truncation=True,
+            max_length=2048,
+        )
+        prompt_lens = prompt_enc["attention_mask"].sum(dim=-1)  # (batch,) int
 
-        # Sum log-probs over response tokens
-        log_probs = outputs.logits.log_softmax(dim=-1)
-        return log_probs.mean(dim=[1, 2])  # (B*G,) aggregated
+        # Forward pass
+        outputs = model(**inputs)
+        logprobs_all = outputs.logits.log_softmax(dim=-1)  # (batch, seq_len, vocab)
+
+        # Gather per-token log-probs for response tokens, per-sample
+        seq_logprobs = []
+        for i in range(batch_size):
+            p_len = int(prompt_lens[i].item())
+            s_len = int(attention_mask[i].sum().item())
+
+            if p_len >= s_len:
+                # Empty or zero-length response → neutral log-prob
+                seq_logprobs.append(torch.tensor(0.0, device=self.device))
+                continue
+
+            # logprobs[pos] is the model's prediction for token at pos
+            # We want predictions for response tokens:
+            #   logprobs[p_len-1] predicts token[p_len]   (1st response token)
+            #   logprobs[s_len-2] predicts token[s_len-1] (last response token)
+            pred_lp = logprobs_all[i, p_len - 1 : s_len - 1, :]    # (resp_len, vocab)
+            resp_ids = input_ids[i, p_len : s_len]                  # (resp_len,)
+
+            # Gather log-prob of each actual response token
+            token_lp = pred_lp.gather(dim=-1, index=resp_ids.unsqueeze(-1)).squeeze(-1)
+
+            # Mean over response tokens for numerical stability
+            seq_logprobs.append(token_lp.mean())
+
+        return torch.stack(seq_logprobs)  # (batch,)
 
     def step(self, prompts: List[str]) -> GRPOStepOutput:
         """
         Execute a single GRPO training step.
+
+        Data flow:
+          prompts (B) → generate G each → responses (B*G)
+          → rewards (B*G) → group-normalize → advantages (B*G)
+          → log_probs_old (B*G, no grad)
+          → log_probs_ref (B*G, no grad, for KL)
+          → [PPO epoch] log_probs (B*G, with grad)
+            → ratio = exp(log_p - log_p_old)
+            → ppo_loss = -min(ratio*A, clip(ratio)*A)
+            → kl_k3 = exp(log_ref - log_p) - (log_ref - log_p) - 1
+            → total_loss = mean(ppo_loss + beta * kl_k3)
+            → backward → step
 
         Args:
             prompts: list of B prompt strings
@@ -210,27 +292,34 @@ class GRPOTrainer:
             prompts=expanded_prompts,
             responses=responses,
             group_size=G,
+            correct_answers=getattr(self, '_current_correct_answers', None),
         )
         rewards = rewards.to(self.device)
 
         # ── Step 3: Compute Group-Relative Advantages ──
         advantages = compute_grpo_advantage(rewards, group_size=G)
 
-        # ── Step 4: PPO Update ──
-        total_policy_loss = 0.0
-
-        # Build full texts once for reuse
-        full_texts = [p + r for p, r in zip(expanded_prompts, responses)]
-
-        # Compute old log_probs (no grad, then free activations)
+        # ── Step 4: Pre-compute old + reference log_probs (no grad, once) ──
         with torch.no_grad():
-            log_probs_old = self._compute_log_probs(expanded_prompts, responses).detach()
+            log_probs_old = self._compute_log_probs(
+                expanded_prompts, responses, model=self.policy
+            )
+            log_probs_ref = self._compute_log_probs(
+                expanded_prompts, responses, model=self.ref_model
+            )
         torch.cuda.empty_cache()
+
+        # ── Step 5: PPO Update with KL penalty ──
+        total_policy_loss = 0.0
+        kl_k3 = None  # will hold the last epoch's KL for logging
 
         for _ in range(self.config.ppo_epochs):
             # Compute current log_probs WITH gradients
-            log_probs = self._compute_log_probs(expanded_prompts, responses)
+            log_probs = self._compute_log_probs(
+                expanded_prompts, responses, model=self.policy
+            )
 
+            # PPO clipped surrogate
             ratio = (log_probs - log_probs_old).exp()
             surr1 = ratio * advantages
             surr2 = (
@@ -240,52 +329,37 @@ class GRPOTrainer:
                 )
                 * advantages
             )
-            policy_loss = -torch.min(surr1, surr2).mean()
+            ppo_loss = -torch.min(surr1, surr2)  # (B*G,)
 
-            # ── Step 5: Backward ──
+            # KL penalty: k3 estimator of KL(π_θ || π_ref), always >= 0
+            log_ratio = log_probs_ref - log_probs  # log(π_ref / π_θ)
+            kl_k3 = log_ratio.exp() - log_ratio - 1  # (B*G,), >= 0
+            kl_penalty = self.config.kl_beta * kl_k3
+
+            total_loss = (ppo_loss + kl_penalty).mean()
+
+            # ── Backward ──
             self.optimizer.zero_grad()
-            policy_loss.backward()
+            total_loss.backward()
             torch.nn.utils.clip_grad_norm_(
                 self.policy.parameters(), self.config.max_grad_norm
             )
             self.optimizer.step()
 
-            total_policy_loss += policy_loss.item()
+            total_policy_loss += total_loss.item()
 
             # Free gradient graph to reclaim VRAM
             del log_probs
             torch.cuda.empty_cache()
 
-        # ── Step 6: KL Divergence (monitoring only, AFTER freeing policy forward) ──
-        with torch.no_grad():
-            ref_inputs = self.tokenizer(
-                full_texts,
-                return_tensors="pt",
-                padding=True,
-                truncation=True,
-                max_length=4096,
-            ).to(self.device)
-            ref_outputs = self.ref_model(**ref_inputs)
-            ref_logits = ref_outputs.logits
-            del ref_outputs
+        # ── Step 6: Update KL controller ──
+        kl_div = kl_k3.mean().item() if kl_k3 is not None else 0.0
+        # Entropy proxy: negative mean log-prob (higher = model is less confident)
+        entropy = -log_probs_old.mean().item()
+        self.kl_controller.step(kl_div)
+        beta = self.kl_controller.beta
 
-            policy_inputs = self.tokenizer(
-                full_texts,
-                return_tensors="pt",
-                padding=True,
-                truncation=True,
-                max_length=4096,
-            ).to(self.device)
-            policy_outputs = self.policy(**policy_inputs)
-            policy_logits = policy_outputs.logits
-            del policy_outputs
-
-        kl_div = self.kl_controller.compute_kl(policy_logits, ref_logits)
-        entropy = self.kl_controller.compute_entropy(policy_logits)
-        beta = self.kl_controller.step(kl_div)
-        torch.cuda.empty_cache()
-
-        del log_probs_old
+        del log_probs_old, log_probs_ref
 
         self.step_count += 1
 

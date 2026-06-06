@@ -68,6 +68,7 @@ class CompositeReward:
         judge_model: str = "deepseek-chat",
         judge_base_url: str = "https://api.deepseek.com/v1",
         use_judge: bool = True,
+        debug_noise: float = 0.0,
     ):
         self.w_format = w_format
         self.w_judge = w_judge
@@ -76,32 +77,44 @@ class CompositeReward:
         self.judge_model = judge_model
         self.judge_base_url = judge_base_url
         self.use_judge = use_judge
+        self.debug_noise = debug_noise
 
     # ── Component 1: Format Reward (hard constraint) ──
 
     def format_reward(self, response: str) -> float:
         """
-        Check for strict tag compliance.
+        Continuous format quality score. Avoids binary reward collapse.
 
-        Returns:
-            +0.1 if both tags present and well-formed
-            -1.0 if either tag is missing or malformed
+        Scores 4 tag components independently:
+          <thinking> + </thinking> + <answer> + </answer>
+        Each = +0.25. Max = 1.0, Min = 0.0.
+
+        This creates natural variance across responses — some may have
+        malformed tags, partial closures, etc.
         """
-        has_thinking = bool(THINKING_PATTERN.search(response))
-        has_answer = bool(ANSWER_PATTERN.search(response))
+        score = 0.0
+        if '<thinking>' in response.lower():
+            score += 0.25
+        if '</thinking>' in response.lower():
+            score += 0.25
+        if '<answer>' in response.lower():
+            score += 0.25
+        if '</answer>' in response.lower():
+            score += 0.25
 
-        if has_thinking and has_answer:
-            return FORMAT_COMPLIANCE_REWARD
+        # Penalize empty tags (reward hacking signal)
+        empty_answer = bool(re.search(r'<answer>\s*</answer>', response, re.IGNORECASE))
+        if empty_answer:
+            score = max(0.0, score - 0.5)
 
-        # Partial compliance: log which tag is missing
-        if not has_thinking and not has_answer:
-            logger.debug("Format violation: missing both <thinking> and <answer> tags")
-        elif not has_thinking:
-            logger.debug("Format violation: missing <thinking> tag")
-        else:
-            logger.debug("Format violation: missing <answer> tag")
+        if score < 1.0:
+            logger.debug(f"Format score={score:.2f}: "
+                        f"t_open={'<thinking>' in response}, "
+                        f"t_close={'</thinking>' in response}, "
+                        f"a_open={'<answer>' in response}, "
+                        f"a_close={'</answer>' in response}")
 
-        return FORMAT_VIOLATION_PENALTY
+        return score
 
     # ── Component 2: LLM-as-a-Judge (soft constraint) ──
 
@@ -251,45 +264,97 @@ Output ONLY a JSON object:
         prompts: List[str],
         responses: List[str],
         questions: Optional[List[str]] = None,
+        correct_answers: Optional[List[str]] = None,
     ) -> torch.Tensor:
         """
         Compute composite reward for a batch of (prompt, response) pairs.
 
         Args:
-            prompts:   list of prompt strings
-            responses: list of model-generated response strings
-            questions: optional list of cleaned question strings for judge
+            prompts:         list of prompt strings
+            responses:       list of model-generated response strings
+            questions:       optional list of cleaned question strings for judge
+            correct_answers: optional list of ground-truth answers for correctness check
 
         Returns:
-            rewards: (B,) tensor of scalar rewards in approximately [-1.0, 1.0] range
+            rewards: (B,) tensor of scalar rewards in ~[0.0, 1.0] range
         """
         if questions is None:
-            questions = prompts  # fallback: use full prompt as question context
+            questions = prompts
+        if correct_answers is None:
+            correct_answers = [None] * len(responses)
 
         rewards = []
-        for prompt, response, question in zip(prompts, responses, questions):
+        for prompt, response, question, gold in zip(
+            prompts, responses, questions, correct_answers
+        ):
             r_format = self.format_reward(response)
             r_diversity = self.diversity_reward(response)
 
-            # Only call judge if format is compliant (save API cost)
-            if r_format > 0 and self.use_judge:
+            # Correctness: check if model's <answer> matches ground truth
+            r_correct = self._check_correctness(response, gold)
+
+            # Judge score (DeepSeek API or heuristic fallback)
+            if self.use_judge and self.api_key and r_format > 0.5:
                 r_judge = self.judge_reward(question, response)
-            elif r_format < 0:
-                r_judge = 0.0
             else:
-                # Heuristic fallback — varies per response, not flat 0.5
                 r_judge = self._heuristic_score(response)
 
-            # Weighted combination
+            # Weighted combination — correctness is the biggest signal
             total = (
                 self.w_format * r_format
                 + self.w_judge * r_judge
                 + self.w_diversity * r_diversity
+                + 0.3 * r_correct  # Hardcoded correctness weight
             )
+            # Normalize to [0, 1]
+            total = total / (self.w_format + self.w_judge + self.w_diversity + 0.3)
 
             rewards.append(total)
 
         return torch.tensor(rewards, dtype=torch.float32)
+
+    def _check_correctness(self, response: str, gold_answer: str) -> float:
+        """Check if extracted answer matches ground truth. Returns 0.0 or 1.0."""
+        if not gold_answer:
+            return 0.5  # Unknown, no signal
+
+        # Extract answer from <answer> tags
+        match = re.search(r'<answer>\s*(.+?)\s*</answer>', response, re.DOTALL | re.IGNORECASE)
+        if not match:
+            return 0.0  # No answer found
+
+        predicted = match.group(1).strip().lower()
+
+        # Try option letter match (e.g., "E" or "E." or "E)")
+        gold_idx = gold_answer.strip()[0].upper() if gold_answer else ""
+        if gold_idx in "ABCDEF":
+            # Check if prediction starts with the correct letter
+            pred_first = predicted[0].upper() if predicted else ""
+            if pred_first == gold_idx:
+                return 1.0
+            if gold_idx in predicted.upper():
+                return 0.8
+
+        # Try text match
+        gold_text = gold_answer.strip().lower()
+        # Remove option letter prefix from gold (e.g., "E. Nitrofurantoin" -> "nitrofurantoin")
+        if len(gold_text) > 2 and gold_text[0] in "abcdef" and gold_text[1] in ". )":
+            gold_text = gold_text[2:].strip()
+
+        if gold_text and gold_text in predicted:
+            return 1.0
+
+        # Partial match: key words
+        gold_words = set(gold_text.lower().split())
+        pred_words = set(predicted.lower().split())
+        if gold_words and pred_words:
+            overlap = len(gold_words & pred_words) / max(len(gold_words), 1)
+            if overlap > 0.7:
+                return 0.8
+            elif overlap > 0.4:
+                return 0.5
+
+        return 0.0
 
     def compute_group_rewards(
         self,
@@ -297,6 +362,7 @@ Output ONLY a JSON object:
         responses: List[str],
         group_size: int,
         questions: Optional[List[str]] = None,
+        correct_answers: Optional[List[str]] = None,
     ) -> Tuple[torch.Tensor, Dict[str, float]]:
         """
         Compute rewards organized by group, returning both the reward tensor
@@ -307,7 +373,8 @@ Output ONLY a JSON object:
             stats:          {"mean_reward", "std_reward", "format_violation_rate", ...}
         """
         rewards = self(
-            prompts=prompts, responses=responses, questions=questions
+            prompts=prompts, responses=responses, questions=questions,
+            correct_answers=correct_answers,
         )
 
         B = len(prompts) // group_size
@@ -318,7 +385,7 @@ Output ONLY a JSON object:
             "std_reward": rewards.std().item(),
             "group_mean_std": rewards_grouped.std(dim=-1).mean().item(),
             # Ratio of responses that violated format (indicator of hacking/instability)
-            "format_violation_rate": (rewards < -0.5).float().mean().item(),
+            "format_violation_rate": (rewards < 0.0).float().mean().item(),
         }
 
         # Warning: reward homogeneity detected
